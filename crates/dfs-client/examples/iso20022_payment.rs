@@ -120,6 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     "object should be deleted"
     // );
     // println!("Deleted + confirmed gone");
+
     let retrieved = client
         .get("b3aead2514a1ad00c84295283f57c4a6cea42d3cd7c29b0bb31de77fff9e2c58")
         .await?;

@@ -197,7 +197,7 @@ rm -rf /tmp/node{1,2,3}   # wipe all data dirs
 
 ```sh
 # Terminal 1: start a node
-cargo run -p dfs-node -- --data-dir /tmp/hello --listen :9001
+cargo run -p dfs-node -- --data-dir /tmp/hello --listen 0.0.0.0:9001
 
 # Terminal 2: run the hello example
 cargo run -p dfs-client --example hello_dfs -- --nodes 127.0.0.1:9001

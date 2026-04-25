@@ -14,7 +14,7 @@ use dfs_node_lib::server::proto::data_node_server::DataNodeServer;
 use dfs_node_lib::tracing_setup::TraceConfig;
 use std::sync::Arc;
 use tokio::signal;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 use tracing::info;
 
 #[tokio::main]
@@ -53,23 +53,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Background tasks ──────────────────────────────────────────
-    let gossip_handle = tokio::spawn(gossip_loop::run(
-        Arc::clone(&swimmer),
-        ring_tx,
-        vec![],
-    ));
+    let gossip_handle = tokio::spawn(gossip_loop::run(Arc::clone(&swimmer), ring_tx, vec![]));
 
-    let repair_handle = tokio::spawn(repair_loop::run(
-        disk.clone(),
-        ring_rx,
-    ));
+    let repair_handle = tokio::spawn(repair_loop::run(disk.clone(), ring_rx));
 
     // ── gRPC server ───────────────────────────────────────────────
     let addr = args.listen.parse()?;
-let svc = DataNodeService::with_membership(
-        disk,
-       Arc::clone(&swimmer),
-    );
+    let svc = DataNodeService::with_membership(disk, Arc::clone(&swimmer));
     let server = DataNodeServer::new(svc);
 
     let grpc = tonic::transport::Server::builder()
