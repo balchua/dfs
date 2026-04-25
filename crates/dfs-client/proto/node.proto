@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package dfs.node.v1;
+
+// ── Block-level CRUD ──────────────────────────────────────────────
+
+message BlockMeta {
+    string block_id = 1;
+    string object_id = 2;
+    uint32 shard_index = 3;
+    uint64 ring_version = 4;
+    bytes checksum = 5;         // 32-byte blake3
+    uint64 size = 6;
+}
+
+message Shard {
+    uint32 index = 1;
+    bytes data = 2;
+}
+
+message PutBlockRequest {
+    Shard shard = 1;
+    BlockMeta meta = 2;
+}
+
+message PutBlockResponse {}
+// Errors returned via gRPC status codes.
+
+message GetBlockRequest {
+    string block_id = 1;
+}
+
+message GetBlockResponse {
+    Shard shard = 1;
+    BlockMeta meta = 2;
+}
+
+message DeleteBlockRequest {
+    string block_id = 1;
+}
+
+message DeleteBlockResponse {}
+
+message ListBlocksRequest {}
+
+message ListBlocksResponse {
+    repeated string block_ids = 1;
+}
+
+message BlockCountRequest {}
+
+message BlockCountResponse {
+    uint64 count = 1;
+}
+
+message StatBlockRequest {
+    string block_id = 1;
+}
+
+message StatBlockResponse {
+    BlockMeta meta = 1;
+}
+
+// ── Membership / Ring ─────────────────────────────────────────────
+
+message JoinRequest {
+    string node_id = 1;       // UUID of the joining node
+    string listen_addr = 2;
+}
+
+message Ring {
+    repeated string node_ids = 1;  // ordered UUIDs
+    uint64 version = 2;
+}
+
+message JoinResponse {
+    Ring ring = 1;
+}
+
+message GossipRequest {
+    string payload = 1;       // bincode-encoded GossipMessage
+}
+
+message GossipResponse {}
+
+message PingRequest {}
+message PongResponse {}
+
+// ── Repair / Stream (future) ──────────────────────────────────────
+
+message HealthCheckRequest {}
+message HealthCheckResponse {
+    uint64 block_count = 1;
+    bytes disk_used = 2;      // approximate
+}
+
+// ── Service ───────────────────────────────────────────────────────
+
+service DataNode {
+    // Block operations
+    rpc PutBlock(PutBlockRequest) returns (PutBlockResponse);
+    rpc GetBlock(GetBlockRequest) returns (GetBlockResponse);
+    rpc DeleteBlock(DeleteBlockRequest) returns (DeleteBlockResponse);
+    rpc ListBlocks(ListBlocksRequest) returns (ListBlocksResponse);
+    rpc BlockCount(BlockCountRequest) returns (BlockCountResponse);
+    rpc StatBlock(StatBlockRequest) returns (StatBlockResponse);
+
+    // Membership
+    rpc Join(JoinRequest) returns (JoinResponse);
+    rpc Gossip(GossipRequest) returns (GossipResponse);
+    rpc Ping(PingRequest) returns (PongResponse);
+
+    // Health
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}

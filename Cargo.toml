@@ -1,0 +1,55 @@
+[workspace]
+members = [
+    "crates/dfs-core",
+    "crates/dfs-node",
+    "crates/dfs-client",
+    # "crates/dfs-sim",
+]
+resolver = "2"
+
+[workspace.dependencies]
+turmoil = { version = "0.7", features = ["unstable-fs", "unstable-barriers"] }
+tokio = { version = "1", features = ["full"] }
+reed-solomon-erasure = "6"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+clap = { version = "4", features = ["derive"] }
+tonic = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "tonic", "trace", "logs"] }
+hex = "0.4"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+dead_code = { level = "deny", priority = -1 }
+unused = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -2 }
+pedantic = { level = "deny", priority = -2 }
+nursery = { level = "deny", priority = -2 }
+cargo = { level = "deny", priority = -2 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+allow_attributes_without_reason = "deny"
+
+# Relaxed rules — these produce too many false positives or
+# only matter in edge cases irrelevant to our design.
+missing_docs_in_crate_items = { level = "allow", priority = -1 }
+iter_on_empty_collections = "allow"
+iter_without_into_iter = "allow"
+missing_structural_std_hash = "allow"

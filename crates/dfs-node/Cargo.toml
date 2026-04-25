@@ -1,0 +1,45 @@
+[package]
+name = "dfs-node"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "dfs-node"
+path = "src/main.rs"
+
+[lib]
+name = "dfs_node_lib"
+path = "src/lib.rs"
+
+[dependencies]
+dfs-core = { path = "../dfs-core" }
+tokio.workspace = true
+serde.workspace = true
+bincode.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true
+clap.workspace = true
+tonic.workspace = true
+tonic-prost = "0.14"
+prost.workspace = true
+prost-types.workspace = true
+tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+rand = "0.9"
+chrono = "0.4"
+bytes = "1"
+blake3.workspace = true
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+hex.workspace = true
+blake3.workspace = true
