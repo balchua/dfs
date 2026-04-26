@@ -15,9 +15,6 @@ use uuid::Uuid;
 pub type NodeId = Uuid;
 
 /// Unique identifier for an object stored in the DFS.
-///
-/// For permanent objects this is derived from the content hash (blake3).
-/// For transient objects this is a UUID or a path-based identifier.
 pub type ObjectId = String;
 
 /// Index of a shard within an erasure-coded stripe.
@@ -135,42 +132,19 @@ impl Ring {
 
 /// Specifies how data is stored across nodes.
 ///
-/// Different object types require different durability strategies:
-/// - Permanent objects (final blobs) use erasure coding for space efficiency.
-/// - Transient objects (multipart parts) use replication for simplicity
-///   and fast deletion.
+/// All objects use erasure coding for space-efficient durability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StorageClass {
-    /// Erasure-coded storage for permanent durable objects.
-    ///
-    /// Data is split into `k` data shards + `m` parity shards and
-    /// distributed across `k+m` distinct nodes.
-    Permanent {
-        /// How much effort to put into encoding and parity. TODO.
-        ec: ErasureConfig,
-    },
-
-    /// Simple replication for temporary transient objects.
-    ///
-    /// The full object is copied to `r_factor` distinct nodes.
-    /// Suitable for multipart upload parts, staging data, and caches.
-    Transient {
-        /// Number of full replicas to maintain.
-        r_factor: u8,
-    },
+pub struct StorageClass {
+    /// Erasure coding configuration.
+    pub ec: ErasureConfig,
 }
 
 impl StorageClass {
-    /// Create a permanent storage class with the given EC configuration.
-    pub const fn permanent(k: u8, m: u8) -> Self {
-        Self::Permanent {
+    /// Create a storage class with the given EC configuration.
+    pub const fn new(k: u8, m: u8) -> Self {
+        Self {
             ec: ErasureConfig { k, m },
         }
-    }
-
-    /// Create a transient storage class with the given replication factor.
-    pub const fn transient(r_factor: u8) -> Self {
-        Self::Transient { r_factor }
     }
 }
 
@@ -258,20 +232,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_class_permanent() {
-        let sc = StorageClass::permanent(3, 2);
-        assert!(matches!(sc, StorageClass::Permanent { ec: ErasureConfig { k: 3, m: 2 } }));
-    }
-
-    #[test]
-    fn storage_class_transient() {
-        let sc = StorageClass::transient(3);
-        assert!(matches!(sc, StorageClass::Transient { r_factor: 3 }));
+    fn storage_class_new() {
+        let sc = StorageClass::new(3, 2);
+        assert_eq!(sc.ec.k, 3);
+        assert_eq!(sc.ec.m, 2);
     }
 
     #[test]
     fn storage_class_serde_roundtrip() {
-        let sc = StorageClass::Permanent { ec: ErasureConfig { k: 5, m: 2 } };
+        let sc = StorageClass::new(5, 2);
         let json = serde_json::to_string(&sc).unwrap();
         let decoded: StorageClass = serde_json::from_str(&json).unwrap();
         assert_eq!(sc, decoded);

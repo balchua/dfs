@@ -62,12 +62,6 @@ pub struct ObjectMetadata {
     pub size: u64,
 }
 
-#[derive(Debug, Clone)]
-pub struct PartMetadata {
-    pub part_object_id: String,
-    pub size: u64,
-}
-
 // ---------------------------------------------------------------------------
 // DfsClient
 // ---------------------------------------------------------------------------
@@ -94,7 +88,7 @@ impl DfsClient {
 pub async fn put(&self, data: &[u8]) -> Result<ObjectMetadata> {
         if data.len() > 20 * 1024 * 1024 {
             return Err(ClientError::Encoding(
-                "object too large for single put (>20MB), use multipart put_part".into(),
+                "object too large for single put (>20MB)".into(),
             ));
         }
         let object_id = Uuid::now_v7().to_string();
@@ -210,68 +204,6 @@ pub async fn put(&self, data: &[u8]) -> Result<ObjectMetadata> {
             checksum: meta.checksum,
             size: meta.size,
         })
-    }
-
-    // ── Transient (multipart parts) ──────────────────────────────
-
-    pub async fn put_part(
-        &self,
-        upload_id: &str,
-        part_number: u32,
-        data: &[u8],
-    ) -> Result<PartMetadata> {
-        let part_base = format!("mpu-{upload_id}-part-{part_number:05}");
-        let block_id = BlockId::new(&part_base, 0, 1);
-        let meta = BlockMeta::new(&part_base, 0, 1, data);
-        let shard = Shard {
-            index: 0,
-            data: data.to_vec(),
-        };
-        let req = PutBlockRequest {
-            shard: Some(shard.into()),
-            meta: Some(meta.into()),
-        };
-
-        // Write to ALL nodes so parts survive single node failure.
-        let mut written = 0usize;
-        for addr in &self.node_addrs {
-            if try_put_shard(addr, &req).await.is_ok() {
-                written += 1;
-            }
-        }
-        if written == 0 {
-            return Err(ClientError::Encoding("put_part: all nodes unreachable".into()));
-        }
-
-        Ok(PartMetadata {
-            part_object_id: block_id.0,
-            size: data.len() as u64,
-        })
-    }
-
-    pub async fn get_part(&self, part_object_id: &str) -> Result<Vec<u8>> {
-        for addr in &self.node_addrs {
-            let block_id = BlockId(part_object_id.to_owned());
-            match try_fetch_shard(addr, &block_id).await {
-                Ok(shard) => return Ok(shard.data),
-                Err(_) => continue,
-            }
-        }
-        Err(ClientError::NotFound(part_object_id.into()))
-    }
-
-    pub async fn delete_part(&self, part_object_id: &str) -> Result<()> {
-        let req = DeleteBlockRequest {
-            block_id: part_object_id.to_string(),
-        };
-        for addr in &self.node_addrs {
-            let mut client = match DnClient::connect(format!("http://{addr}")).await {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let _ = client.delete_block(req.clone()).await;
-        }
-        Ok(())
     }
 }
 

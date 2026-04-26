@@ -216,9 +216,9 @@ cargo run -p dfs-client --example iso20022_payment -- \
     --nodes 127.0.0.1:9001,127.0.0.1:9002,127.0.0.1:9003
 ```
 
-This generates ~1.8 MB of ISO 20022 pain.001 XML, uploads it via
-chunked transient parts (simulating S3 multipart), assembles, EC encodes
-to permanent storage, reads back, verifies the checksum, and deletes.
+This generates ~1.8 MB of ISO 20022 pain.001 XML, uploads it in
+chunks via separate `put()` calls, reads each chunk back, assembles
+them into a temp file, verifies the size, and deletes all chunks.
 
 ## 10. Integration tests (automated)
 

@@ -2,7 +2,7 @@
 //!
 //! This crate provides **pure**, deterministic logic for:
 //! - **Erasure coding**: Reed-Solomon encode/decode of byte payloads.
-//! - **Data placement**: Rendezvous hashing to assign shards/replicas to nodes.
+//! - **Data placement**: Rendezvous hashing to assign shards to nodes.
 //! - **Membership**: Ring versioning and health tracking.
 //! - **Block metadata**: Checksum computation and integrity verification.
 //! - **Shared types**: Ring, ErasureConfig, StorageClass, NodeId, etc.
@@ -31,7 +31,7 @@
 //!     uuid::Uuid::new_v4(),
 //! ]);
 //! let placements = placement::place("my-object",
-//!     StorageClass::Permanent { ec: config }, &ring).unwrap();
+//!     StorageClass::new(3, 2), &ring).unwrap();
 //!
 //! // dispatch to nodes ...
 //!

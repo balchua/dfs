@@ -51,58 +51,20 @@ pub fn assign_node(
 
 /// Assign all shards of an object to nodes.
 ///
-/// For [`StorageClass::Permanent`], produces `k+m` assignments via
-/// [`assign_node`], with best-effort node uniqueness.
-///
-/// For [`StorageClass::Transient`], assigns the full object to
-/// `r_factor` distinct nodes.
-///
-/// # Returns
-/// Either a `Vec<(ShardIndex, NodeId)>` for permanent objects, or
-/// `Vec<NodeId>` for transient replicas.
-#[derive(Debug, Clone)]
-pub enum Placement {
-    /// EC shard placements: (shard_index, target_node).
-    Permanent(Vec<(ShardIndex, NodeId)>),
-
-    /// Full-object replica placements.
-    Transient(Vec<NodeId>),
-}
-
-/// Full placement of an object across the ring.
+/// Produces `k+m` assignments via [`assign_node`].
 ///
 /// # Errors
 /// - [`CoreError::NoNodesLeft`] if the ring is empty.
-/// - [`CoreError::InsufficientNodes`] if not enough distinct nodes are
-///   available for the required placement count.
 pub fn place(
     object_key: &str,
     class: StorageClass,
     ring: &Ring,
-) -> Result<Placement> {
+) -> Result<Vec<(ShardIndex, NodeId)>> {
     if ring.nodes.is_empty() {
         return Err(CoreError::NoNodesLeft);
     }
 
-    match class {
-        StorageClass::Permanent { ec } => place_permanent(object_key, ec, ring),
-        StorageClass::Transient { r_factor } => {
-            place_transient(object_key, r_factor, ring)
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Internals
-// ---------------------------------------------------------------------------
-
-fn place_permanent(
-    object_key: &str,
-    config: ErasureConfig,
-    ring: &Ring,
-) -> Result<Placement> {
-    let total = config.total_shards() as usize;
-
+    let total = class.ec.total_shards() as usize;
     let mut assignments = Vec::with_capacity(total);
 
     for shard in 0..total as ShardIndex {
@@ -110,39 +72,7 @@ fn place_permanent(
         assignments.push((shard, node));
     }
 
-    Ok(Placement::Permanent(assignments))
-}
-
-fn place_transient(
-    object_key: &str,
-    r_factor: u8,
-    ring: &Ring,
-) -> Result<Placement> {
-    let r = r_factor as usize;
-    if r > ring.nodes.len() {
-        return Err(CoreError::InsufficientNodes {
-            needed: r,
-            available: ring.nodes.len(),
-        });
-    }
-
-    let mut nodes: Vec<NodeId> = (0..r as u8)
-        .map(|i| assign_node(object_key, i, ring))
-        .collect();
-
-    // Deduplicate: shift indices and re-assign if collisions occur.
-    // Simple approach: increment a counter and re-hash.
-    let mut seen = std::collections::HashSet::new();
-    for (i, node_ref) in nodes.iter_mut().enumerate() {
-        let mut attempt = 0u8;
-        while !seen.insert(*node_ref) {
-            attempt += 1;
-            let key = format!("{object_key}-rep-{i}-{attempt}");
-            *node_ref = assign_node(&key, 0, ring);
-        }
-    }
-
-    Ok(Placement::Transient(nodes))
+    Ok(assignments)
 }
 
 /// Compute the rendezvous hash for `(key, node)`.
@@ -185,13 +115,11 @@ mod tests {
     #[test]
     fn different_keys_different_assignments() {
         let ring = ring_5();
-        // Over many keys, assignments should spread across nodes.
         let mut counts = std::collections::HashMap::new();
         for i in 0..1000u32 {
             let n = assign_node(&i.to_string(), 0, &ring);
             *counts.entry(n).or_insert(0) += 1;
         }
-        // Each of 5 nodes should get ~20% ± margin.
         for (_, c) in counts {
             assert!(c > 100, "node had {c} assignments, expected spread");
             assert!(c < 300, "node had {c} assignments, expected spread");
@@ -199,45 +127,21 @@ mod tests {
     }
 
     #[test]
-    fn place_permanent_returns_k_plus_m() {
+    fn place_returns_k_plus_m_assignments() {
         let ring = ring_5();
-        match place("obj", StorageClass::permanent(3, 2), &ring).unwrap() {
-            Placement::Permanent(assignments) => {
-                assert_eq!(assignments.len(), 5);
-            }
-            Placement::Transient(_) => panic!("expected Permanent"),
-        }
-    }
-
-    #[test]
-    fn place_transient_with_r_factor() {
-        let ring = ring_5();
-        match place("part", StorageClass::transient(3), &ring).unwrap() {
-            Placement::Transient(nodes) => {
-                assert_eq!(nodes.len(), 3);
-                // All distinct
-                let mut set = std::collections::HashSet::new();
-                for n in &nodes {
-                    set.insert(*n);
-                }
-                assert_eq!(set.len(), 3);
-            }
-            Placement::Permanent(_) => panic!("expected Transient"),
+        let assignments = place("obj", StorageClass::new(3, 2), &ring).unwrap();
+        assert_eq!(assignments.len(), 5);
+        // Each entry is (ShardIndex, NodeId)
+        for (i, (_shard, _node)) in assignments.iter().enumerate() {
+            assert_eq!(*_shard, i as u8);
         }
     }
 
     #[test]
     fn place_empty_ring_fails() {
         let ring = Ring { nodes: vec![], version: 1 };
-        let e = place("obj", StorageClass::permanent(3, 2), &ring).unwrap_err();
+        let e = place("obj", StorageClass::new(3, 2), &ring).unwrap_err();
         assert_eq!(e, CoreError::NoNodesLeft);
-    }
-
-    #[test]
-    fn transient_too_few_nodes_fails() {
-        let ring = Ring::new(vec![uuid::Uuid::from_u128(0x1)]);
-        let e = place("x", StorageClass::transient(5), &ring).unwrap_err();
-        assert!(matches!(e, CoreError::InsufficientNodes { .. }));
     }
 
     #[test]
@@ -254,7 +158,6 @@ mod tests {
             if n5 != n6 { changed += 1; }
         }
 
-        // Adding one node should only remap ~1/6th of the keys.
         let pct = (changed as f64 / 1000.0) * 100.0;
         assert!(pct > 5.0 && pct < 30.0,
                 "expected remap ~16%, got {pct:.1}%");

@@ -2,7 +2,7 @@
 
 ## Overview
 
-DFS is a content-addressed, erasure-coded object store. Clients upload
+DFS is a erasure-coded object store. Clients upload
 byte payloads that are split into Reed-Solomon shards and distributed
 across independent data nodes. The system can tolerate up to `m`
 simultaneous **shard** losses — but with fewer than `k+m` nodes,
@@ -25,10 +25,8 @@ recovery capacity).
 
 ### Object
 
-The unit of storage — a byte payload with an `ObjectId`. For permanent
-objects, the `ObjectId` is derived from the blake3 content hash of the
-payload (content-addressed). For transient parts, it is a UUID-like
-path identifier.
+The unit of storage — a byte payload with an `ObjectId`. Each upload
+receives a unique UUIDv7 identifier.
 
 ### Shard
 
@@ -46,12 +44,7 @@ The on-disk representation of a shard. Each block has:
 
 ### Storage Class
 
-Objects are stored under one of two storage classes:
-
-| Class | Strategy | Use Case |
-|---|---|---|
-| `Permanent` | Erasure-coded (k+m shards) | Final objects, long-term storage |
-| `Transient` | Full replication (r copies) | Multipart upload parts, staging |
+Every object is erasure-coded with a configurable `(k, m)` scheme.
 
 ### Ring
 
@@ -74,7 +67,7 @@ for details).
 Client                          Nodes
   │                               │
   ├─ put(data) ───────────────────┤
-  │  1. blake3 hash → object_id   │
+  │  1. UUIDv7 → object_id         │
   │  2. EC encode → k+m shards    │
   │  3. For each shard:           │
   │     a. rendezvous → target    │
@@ -83,7 +76,7 @@ Client                          Nodes
   │◄──── ObjectMetadata ──────────┤
 ```
 
-1. **Hash**: `object_id = hex(blake3::hash(data))`
+1. **ID**: `object_id = Uuid::now_v7()` (unique per upload)
 2. **Encode**: Reed-Solomon `encode(data, k, m)` produces `k+m` shards
 3. **Place**: For each shard, compute rendezvous hash of `(object_id, shard_index)` against the ring to pick a target node
 4. **Write**: gRPC `PutBlock(shard, meta)` to each target node. Each node writes atomically (tmp + rename)
@@ -113,17 +106,6 @@ Client                          Nodes
 At least `k` shards must be successfully fetched. The decode uses
 Reed-Solomon `reconstruct_data` which fills in any missing data shards
 from the available parity before concatenating.
-
-## Data Flow: Multipart Upload
-
-For objects exceeding the 20 MB single-put limit:
-
-1. Split the payload into chunks
-2. `put_part(upload_id, part_number, chunk)` — stores each chunk as a
-   full replica (Transient class) on all nodes
-3. Reassemble parts in order
-4. `put(assembled_data)` — EC-encode and store permanently
-5. `delete_part()` — clean up transient parts
 
 ## Erasure Coding
 
@@ -184,10 +166,7 @@ Properties:
 
 ### Storage Class Placement
 
-| Class | Placement |
-|---|---|
-| `Permanent` | Each of `k+m` shards placed independently via `assign_node()`. May collide on the same node in small rings. |
-| `Transient` | `r_factor` nodes selected, with deduplication via index offsets. |
+Each of `k+m` shards is placed independently via `assign_node()`. Shards may collide on the same node in small rings.
 
 ## Membership
 
@@ -258,9 +237,8 @@ Every `read_block()` call verifies the blake3 checksum stored in the
 {object_id}-{shard_index:02}-v{ring_version}
 
 Examples:
-  b3aead2514a1ad00-00-v1    ← shard 0, ring v1
-  b3aead2514a1ad00-03-v2    ← shard 3, ring v2
-  mpu-demo-part-00001-00-v1 ← transient part (multipart upload)
+  0196a1b2-c3d4-7e5f-8001-020304050607-00-v1    ← shard 0, ring v1
+  0196a1b2-c3d4-7e5f-8001-020304050607-03-v2    ← shard 3, ring v2
 ```
 
 ## Client Architecture
@@ -272,10 +250,7 @@ DfsClient
   ├── put(&[u8])        → ObjectMetadata    (EC-encodes, writes k+m shards)
   ├── get(&str)         → Vec<u8>           (fetches k shards, decodes)
   ├── delete(&str)      → ()                (removes all k+m shards)
-  ├── stat(&str)        → ObjectMetadata    (reads metadata from shard 0)
-  ├── put_part(…)       → PartMetadata      (full replica on all nodes)
-  ├── get_part(&str)    → Vec<u8>           (fetch from first node that responds)
-  └── delete_part(&str) → ()                (delete from all nodes)
+  └── stat(&str)        → ObjectMetadata    (reads metadata from shard 0)
 ```
 
 ### Shard Write Strategy
@@ -284,12 +259,6 @@ The `put()` method tries each shard's preferred node first, then falls
 back through all remaining nodes. It requires at least `k+1` successful
 writes to return success. This handles partial cluster failures during
 writes.
-
-### Multipart Limits
-
-- `put()` rejects payloads > 20 MB (prevents oversized gRPC messages)
-- No per-part limit on `put_part()` — but each part is stored as a full
-  replica on every node (O(N) write amplification)
 
 ## Protobuf Service
 
@@ -369,11 +338,11 @@ dfs-node (gRPC server + disk storage)
     └── repair_loop.rs  — re-tag blocks on ring changes
 
 dfs-client (client library)
-├── lib.rs       — DfsClient (put/get/delete/stat, multipart)
+├── lib.rs       — DfsClient (put/get/delete/stat)
 ├── mem_store    — in-memory gRPC node for tests
 └── examples/
     ├── hello_dfs.rs         — minimal put/get/delete
-    ├── iso20022_payment.rs  — ISO 20022 payment (streaming)
+    ├── iso20022_payment.rs  — ISO 20022 payment (chunked upload)
     ├── recover.rs           — get by object ID
     └── common/iso20022.rs   — XML generator
 ```

@@ -74,23 +74,17 @@ async fn delete_then_not_found() {
 
 #[tokio::test]
 #[allow(clippy::unwrap_used, reason = "tests use unwrap for clarity")]
-async fn multipart_transient() {
-    let addrs = start_nodes(1).await;
+async fn put_get_large_payload() {
+    let addrs = start_nodes(3).await;
     let client = DfsClient::new(addrs);
 
-    let chunks = [b"abc", b"def", b"ghi"];
-    let mut parts = Vec::new();
-    for (i, chunk) in chunks.iter().enumerate() {
-        let pm = client.put_part("mpu-1", (i as u32) + 1, *chunk).await.unwrap();
-        parts.push(pm);
-    }
-    let mut assembled = Vec::new();
-    for p in &parts {
-        assembled.extend_from_slice(&client.get_part(&p.part_object_id).await.unwrap());
-    }
-    assert_eq!(&assembled[..], b"abcdefghi");
-    for p in &parts {
-        client.delete_part(&p.part_object_id).await.unwrap();
-    }
-    println!("multipart transient: OK");
+    // 1 MB payload to exercise larger gRPC messages.
+    let payload: Vec<u8> = (0u8..=255).cycle().take(1_048_576).collect();
+    let meta = client.put(&payload).await.unwrap();
+    println!("put: {} bytes, id {}", meta.size, &meta.object_id[..8]);
+    let data = client.get(&meta.object_id).await.unwrap();
+    assert_eq!(data.len(), payload.len());
+    assert_eq!(data[..16], payload[..16]);
+    assert_eq!(data[payload.len() - 16..], payload[payload.len() - 16..]);
+    println!("large payload: OK");
 }

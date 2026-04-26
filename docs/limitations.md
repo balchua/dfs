@@ -8,12 +8,7 @@
 
 ### Streaming API
 
-The client library (`dfs-client`) only accepts `&[u8]` for both `put()`
-and `put_part()`. There is no `Read`, `AsyncRead`, or `Stream`-based
-API. The ISO 20022 example demonstrates a workaround using temp files,
-but the client itself must still read the assembled file into memory at
-`put()` time. For objects over 20 MB the `put()` call is rejected
-outright.
+The client library (`dfs-client`) only accepts `&[u8]` for `put()`. There is no `Read`, `AsyncRead`, or `Stream`-based API. For objects over 20 MB the `put()` call is rejected outright.
 
 A striped encoding path exists in `dfs-core` (`encode_striped` +
 `StripeConfig`) but it is **not wired into the client**.
@@ -21,9 +16,8 @@ A striped encoding path exists in `dfs-core` (`encode_striped` +
 ### 20 MB Single-Put Limit
 
 `put()` enforces a 20 MB limit to keep gRPC message sizes manageable.
-Objects larger than this must use the multipart workflow (put_part →
-assemble → put), which is inefficient and still hits the limit at
-assembly time.
+Objects larger than this must be split into chunks and uploaded via
+separate `put()` calls, tracked by the caller.
 
 ### No Streaming gRPC
 
@@ -166,11 +160,6 @@ nodes proactively, wasting time on failed connections.
 ### No Connection Pooling
 
 Every gRPC call creates a new HTTP/2 connection.
-
-### No Multipart Assembly Streaming
-
-`get_part()` returns `Vec<u8>` per part — each part is buffered
-individually.
 
 ## Protocol
 
