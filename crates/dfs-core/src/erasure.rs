@@ -9,15 +9,16 @@
 //!
 //! # Data flow
 //! ```text
-//! Write:  plaintext → pad → split into k shards → RS encode → (k+m) shards
-//! Read:   k shards  → RS reconstruct_data → concat → unpad → original
+//! Write:  plaintext → prefix(8B len) → pad → split into k shards → RS encode → (k+m) shards
+//! Read:   k shards  → RS reconstruct_data → concat → read prefix → strip prefix+padding → original
 //! ```
 //!
-//! Padding: data is zero-padded so its length is a multiple of `k`.
-//! Each shard has identical size = `ceil(original_len / k)`.
-//! On decode, trailing zeros are stripped (works for payloads that
-//! do not end in zero bytes; for production use the original length
-//! must be stored in object metadata).
+//! Padding: a 8-byte big-endian original-length prefix is prepended to the
+//! data before splitting. The prefixed payload is then zero-padded so its
+//! length is a multiple of `k`. Each shard has identical size =
+//! `ceil((8 + original_len) / k)`. On decode the prefix is used to
+//! recover the exact original length, which means payloads that end with
+//! zero bytes round-trip correctly.
 
 use crate::types::*;
 use crate::error::*;
@@ -36,30 +37,26 @@ type RsCodec = ReedSolomon;
 /// Each shard has identical size. The first `k` shards are data shards;
 /// the remaining `m` are parity shards.
 ///
+/// The encoder prepends an 8-byte big-endian length prefix to the payload
+/// before splitting so that [`decode`] can recover the exact original
+/// boundary without any heuristic.
+///
 /// # Errors
 /// - [`CoreError::Encoding`] if the reed-solomon library fails.
 pub fn encode(data: &[u8], config: &ErasureConfig) -> Result<Vec<Shard>> {
     let k = config.k as usize;
     let m = config.m as usize;
     let total = k + m;
-    let original_len = data.len();
 
-    // Empty payload: RS rejects zero-length shards. Encoding with k data
-    // shards of size 1 each and dropping the single byte on decode.
-    let (shard_len, padded) = if original_len == 0 {
-        // We cannot pass zero-length shards to RS. Use a single-byte
-        // shard andstrip it during decoding.
-        (1usize, vec![0u8; k])
-    } else {
-        let len = original_len.div_ceil(k);
-        if len == 0 {
-            // original_len > 0 but too small for division (shouldn't happen
-            // since original_len > 0 => at least 1 byte → div_ceil(k) >= 1).
-            (1usize, make_padded(data, 1, k))
-        } else {
-            (len, make_padded(data, len, k))
-        }
-    };
+    // Prepend an 8-byte big-endian original length so that `decode` can
+    // recover the exact payload boundary even when the data ends with zeros.
+    let original_len = data.len() as u64;
+    let mut payload = Vec::with_capacity(8 + data.len());
+    payload.extend_from_slice(&original_len.to_be_bytes());
+    payload.extend_from_slice(data);
+
+    let shard_len = payload.len().div_ceil(k);
+    let padded = make_padded(&payload, shard_len, k);
 
     // Split padded data into k data shards + m empty parity shards.
     let mut shards: Vec<Vec<u8>> = (0..total)
@@ -137,15 +134,28 @@ pub fn decode(
         .map_err(|e| CoreError::Decoding(e.to_string()))?;
 
     // Concatenate first k shards — all guaranteed Some post-reconstruction.
-    let mut result: Vec<u8> = slices[0..k]
+    let result: Vec<u8> = slices[0..k]
         .iter()
         .flat_map(|s| s.as_ref().unwrap())
         .copied()
         .collect();
 
-    let original_len = effective_len(&result);
-    result.truncate(original_len);
-    Ok(result)
+    // Read the 8-byte big-endian length prefix written by `encode`.
+    if result.len() < 8 {
+        return Err(CoreError::Decoding(
+            "reconstructed data too short to contain length prefix".into(),
+        ));
+    }
+    let original_len =
+        u64::from_be_bytes(result[..8].try_into().expect("slice is exactly 8 bytes")) as usize;
+    let end = 8 + original_len;
+    if end > result.len() {
+        return Err(CoreError::Decoding(format!(
+            "length prefix ({original_len}) exceeds reconstructed data ({} bytes after prefix)",
+            result.len() - 8,
+        )));
+    }
+    Ok(result[8..end].to_vec())
 }
 
 /// Compute padded `Vec<u8>` of size `shard_len * k` from `data`.
@@ -154,15 +164,6 @@ fn make_padded(data: &[u8], shard_len: usize, k: usize) -> Vec<u8> {
     let mut padded = vec![0u8; padded_len];
     padded[..data.len()].copy_from_slice(data);
     padded
-}
-
-/// Estimate the original data length from padded shards by removing
-/// trailing zero bytes.
-fn effective_len(data: &[u8]) -> usize {
-    if data.is_empty() {
-        return 0;
-    }
-    data.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1)
 }
 
 /// Stripe configuration for streaming large payloads.
@@ -323,13 +324,34 @@ mod tests {
     }
 
     #[test]
+    fn payload_ending_with_zero_bytes_roundtrips_correctly() {
+        // This is the exact bug that effective_len caused: trailing zero bytes
+        // were stripped, silently corrupting the decoded payload.
+        let data: &[u8] = b"hello\x00\x00\x00";
+        let shards = encode(data, &CFG).unwrap();
+        let all: Vec<Option<Shard>> = shards.iter().map(|s| Some(s.clone())).collect();
+        let decoded = decode(all, &CFG).unwrap();
+        assert_eq!(decoded.as_slice(), data);
+    }
+
+    #[test]
+    fn all_zero_payload_roundtrips_correctly() {
+        let data = vec![0u8; 32];
+        let shards = encode(&data, &CFG).unwrap();
+        let all: Vec<Option<Shard>> = shards.iter().map(|s| Some(s.clone())).collect();
+        let decoded = decode(all, &CFG).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
     fn payload_not_multiple_of_k() {
         let cfg = ErasureConfig { k: 4, m: 2 };
-        // 10 bytes → shard_len = 3 (ceil(10/4)) → padded = 12 bytes.
+        // 10 bytes of data + 8-byte prefix = 18 bytes → shard_len = ceil(18/4) = 5
+        // → padded = 20 bytes.
         let shards = encode(b"0123456789", &cfg).unwrap();
         assert_eq!(shards.len() as u8, cfg.total_shards());
         for s in &shards {
-            assert_eq!(s.data.len(), 3);
+            assert_eq!(s.data.len(), 5);
         }
         let all: Vec<Option<Shard>> = shards.iter().map(|s| Some(s.clone())).collect();
         let decoded = decode(all, &cfg).unwrap();
