@@ -208,8 +208,8 @@ cargo run -p dfs-client --example hello_dfs -- --nodes 127.0.0.1:9001
 ```sh
 # Start 3 nodes (in 3 terminals):
 cargo run -p dfs-node -- --data-dir /tmp/e1 --listen :9001 &
-cargo run -p dfs-node -- --data-dir /tmp/e2 --listen :9002 &
-cargo run -p dfs-node -- --data-dir /tmp/e3 --listen :9003 &
+cargo run -p dfs-node -- --data-dir /tmp/e2 --listen :9002 --join 127.0.0.1:9001 &
+cargo run -p dfs-node -- --data-dir /tmp/e3 --listen :9003 --join 127.0.0.1:9001 &
 
 # Run the example:
 cargo run -p dfs-client --example iso20022_payment -- \

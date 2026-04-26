@@ -20,16 +20,17 @@
 //! ```
 
 use dfs_core::block::{BlockId, BlockMeta, Shard};
-use dfs_core::types::ErasureConfig;
 use dfs_core::erasure;
+use dfs_core::types::ErasureConfig;
 use tracing::debug;
+use uuid::Uuid;
 
 pub mod proto {
     tonic::include_proto!("dfs.node.v1");
 }
 use proto::{
-    data_node_client::DataNodeClient as DnClient,
     DeleteBlockRequest, GetBlockRequest, PutBlockRequest, StatBlockRequest,
+    data_node_client::DataNodeClient as DnClient,
 };
 
 // ---------------------------------------------------------------------------
@@ -88,29 +89,50 @@ impl DfsClient {
         Self { node_addrs, ec }
     }
 
-    // ── Permanent (erasure-coded) ────────────────────────────────
+// ── Permanent (erasure-coded) ────────────────────────────────
 
-    pub async fn put(&self, data: &[u8]) -> Result<ObjectMetadata> {
-        let object_id = hex::encode(blake3::hash(data).as_bytes());
+pub async fn put(&self, data: &[u8]) -> Result<ObjectMetadata> {
+        if data.len() > 20 * 1024 * 1024 {
+            return Err(ClientError::Encoding(
+                "object too large for single put (>20MB), use multipart put_part".into(),
+            ));
+        }
+        let object_id = Uuid::now_v7().to_string();
+        let checksum = blake3::hash(data).into();
         let shards = erasure::encode(data, &self.ec)
             .map_err(|e| ClientError::Encoding(e.to_string()))?;
 
+        let mut written = 0usize;
         for (i, shard) in shards.iter().enumerate() {
             let meta = BlockMeta::new(&object_id, i as u8, 1, &shard.data);
-            let addr = &self.node_addrs[i % self.node_addrs.len()];
             let req = PutBlockRequest {
                 shard: Some(shard.clone().into()),
                 meta: Some(meta.into()),
             };
-            DnClient::connect(format!("http://{addr}"))
-                .await?
-                .put_block(req)
-                .await?;
+            let preferred = i % self.node_addrs.len();
+            let mut ok = false;
+            for offset in 0..self.node_addrs.len() {
+                let addr = &self.node_addrs[(preferred + offset) % self.node_addrs.len()];
+                if try_put_shard(addr, &req).await.is_ok() {
+                    ok = true;
+                    break;
+                }
+            }
+            if ok {
+                written += 1;
+            }
+        }
+
+        if written < self.ec.k as usize + 1 {
+            return Err(ClientError::Encoding(format!(
+                "put: only {written}/{total} shards written",
+                total = shards.len()
+            )));
         }
 
         Ok(ObjectMetadata {
             object_id,
-            checksum: blake3::hash(data).into(),
+            checksum,
             size: data.len() as u64,
         })
     }
@@ -126,34 +148,34 @@ impl DfsClient {
                 break;
             }
             let block_id = BlockId::new(object_id, i as u8, 1);
-            let addr = &self.node_addrs[i % self.node_addrs.len()];
-            let mut client = DnClient::connect(format!("http://{addr}")).await?;
-            let req = GetBlockRequest {
-                block_id: block_id.0.clone(),
-            };
-            match client.get_block(req).await {
-                Ok(resp) => {
-                    let inner = resp.into_inner();
-                    let shard: Shard = inner.shard.ok_or_else(|| {
-                    tonic::Status::internal("empty shard in response")
-                })?.into();
-                collected[i] = Some(shard);
-                    got += 1;
+            let preferred = i % self.node_addrs.len();
+            let mut found = false;
+            for offset in 0..self.node_addrs.len() {
+                let addr = &self.node_addrs[(preferred + offset) % self.node_addrs.len()];
+                match try_fetch_shard(addr, &block_id).await {
+                    Ok(shard) => {
+                        collected[i] = Some(shard);
+                        got += 1;
+                        found = true;
+                        break;
+                    }
+                    Err(e) => {
+                        debug!(shard = i, node = %addr, "shard missing: {e}");
+                    }
                 }
-                Err(e) => {
-                    debug!(shard = i, node = %addr, "shard missing: {e}");
-                }
+            }
+            if !found {
+                debug!(shard = i, "shard not found on any node");
             }
         }
 
         if got < k {
-            return Err(ClientError::Encoding(format!(
-                "insufficient shards: got {got}, need {k}"
+            return Err(ClientError::NotFound(format!(
+                "insufficient shards for get: got {got}, need {k}"
             )));
         }
 
-        erasure::decode(collected, &self.ec)
-            .map_err(|e| ClientError::Encoding(e.to_string()))
+        erasure::decode(collected, &self.ec).map_err(|e| ClientError::NotFound(e.to_string()))
     }
 
     pub async fn delete(&self, object_id: &str) -> Result<()> {
@@ -179,9 +201,10 @@ impl DfsClient {
         };
         let resp = client.stat_block(req).await?;
         let inner = resp.into_inner();
-        let meta: BlockMeta = inner.meta.ok_or_else(|| {
-                    tonic::Status::internal("empty meta in response")
-                })?.into();
+        let meta: BlockMeta = inner
+            .meta
+            .ok_or_else(|| tonic::Status::internal("empty meta in response"))?
+            .into();
         Ok(ObjectMetadata {
             object_id: meta.object_id,
             checksum: meta.checksum,
@@ -208,11 +231,17 @@ impl DfsClient {
             shard: Some(shard.into()),
             meta: Some(meta.into()),
         };
-        let addr = &self.node_addrs[0];
-        DnClient::connect(format!("http://{addr}"))
-            .await?
-            .put_block(req)
-            .await?;
+
+        // Write to ALL nodes so parts survive single node failure.
+        let mut written = 0usize;
+        for addr in &self.node_addrs {
+            if try_put_shard(addr, &req).await.is_ok() {
+                written += 1;
+            }
+        }
+        if written == 0 {
+            return Err(ClientError::Encoding("put_part: all nodes unreachable".into()));
+        }
 
         Ok(PartMetadata {
             part_object_id: block_id.0,
@@ -221,26 +250,63 @@ impl DfsClient {
     }
 
     pub async fn get_part(&self, part_object_id: &str) -> Result<Vec<u8>> {
-        let addr = &self.node_addrs[0];
-        let mut client = DnClient::connect(format!("http://{addr}")).await?;
-        let req = GetBlockRequest {
-            block_id: part_object_id.to_string(),
-        };
-        let resp = client.get_block(req).await?;
-        let shard: Shard = resp.into_inner().shard.ok_or_else(|| {
-                    tonic::Status::internal("empty shard in get_part")
-                })?.into();
-        Ok(shard.data)
+        for addr in &self.node_addrs {
+            let block_id = BlockId(part_object_id.to_owned());
+            match try_fetch_shard(addr, &block_id).await {
+                Ok(shard) => return Ok(shard.data),
+                Err(_) => continue,
+            }
+        }
+        Err(ClientError::NotFound(part_object_id.into()))
     }
 
     pub async fn delete_part(&self, part_object_id: &str) -> Result<()> {
-        let addr = &self.node_addrs[0];
-        let mut client = DnClient::connect(format!("http://{addr}")).await?;
         let req = DeleteBlockRequest {
             block_id: part_object_id.to_string(),
         };
-        client.delete_block(req).await?;
+        for addr in &self.node_addrs {
+            let mut client = match DnClient::connect(format!("http://{addr}")).await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let _ = client.delete_block(req.clone()).await;
+        }
         Ok(())
+    }
+}
+
+// ── Resilient helpers: catch connect + gRPC errors ─────────────
+
+async fn try_put_shard(addr: &str, req: &PutBlockRequest) -> Result<()> {
+    let mut client = match DnClient::connect(format!("http://{addr}")).await {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(ClientError::Transport(e));
+        }
+    };
+    match client.put_block(req.clone()).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(ClientError::Grpc(e)),
+    }
+}
+
+async fn try_fetch_shard(addr: &str, block_id: &BlockId) -> std::result::Result<Shard, String> {
+    let mut client = match DnClient::connect(format!("http://{addr}")).await {
+        Ok(c) => c,
+        Err(e) => return Err(e.to_string()),
+    };
+    let req = GetBlockRequest {
+        block_id: block_id.0.clone(),
+    };
+    match client.get_block(req).await {
+        Ok(resp) => {
+            let inner = resp.into_inner();
+            match inner.shard {
+                Some(s) => Ok(s.into()),
+                None => Err("empty shard".into()),
+            }
+        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -301,17 +367,15 @@ impl From<crate::proto::BlockMeta> for BlockMeta {
 pub mod mem_store {
     use crate::proto::data_node_server::DataNode;
     use crate::proto::{
-        PutBlockRequest, PutBlockResponse, GetBlockRequest, GetBlockResponse,
-        DeleteBlockRequest, DeleteBlockResponse,
-        ListBlocksRequest, ListBlocksResponse, BlockCountRequest, BlockCountResponse,
-        StatBlockRequest, StatBlockResponse,
-        JoinRequest, JoinResponse, GossipRequest, GossipResponse,
-        PingRequest, PongResponse, HealthCheckRequest, HealthCheckResponse,
-        Ring,
+        BlockCountRequest, BlockCountResponse, DeleteBlockRequest, DeleteBlockResponse,
+        GetBlockRequest, GetBlockResponse, GossipRequest, GossipResponse, HealthCheckRequest,
+        HealthCheckResponse, JoinRequest, JoinResponse, ListBlocksRequest, ListBlocksResponse,
+        PingRequest, PongResponse, PutBlockRequest, PutBlockResponse, Ring, StatBlockRequest,
+        StatBlockResponse,
     };
-    
-    use crate::proto::Shard as ProtoShard;
+
     use super::{BlockMeta, Shard};
+    use crate::proto::Shard as ProtoShard;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
     use tonic::{Request, Response, Status};
@@ -328,7 +392,9 @@ pub mod mem_store {
 
     impl MemStorage {
         pub fn new() -> Self {
-            Self { blocks: StdMutex::new(HashMap::new()) }
+            Self {
+                blocks: StdMutex::new(HashMap::new()),
+            }
         }
     }
 
@@ -339,11 +405,17 @@ pub mod mem_store {
             req: Request<PutBlockRequest>,
         ) -> std::result::Result<Response<PutBlockResponse>, Status> {
             let inner = req.into_inner();
-            let meta: BlockMeta = inner.meta.ok_or_else(|| Status::invalid_argument("no meta"))
+            let meta: BlockMeta = inner
+                .meta
+                .ok_or_else(|| Status::invalid_argument("no meta"))
                 .map(Into::into)?;
-            let shard: Shard = inner.shard.ok_or_else(|| Status::invalid_argument("no shard"))
+            let shard: Shard = inner
+                .shard
+                .ok_or_else(|| Status::invalid_argument("no shard"))
                 .map(Into::into)?;
-            self.blocks.lock().unwrap()
+            self.blocks
+                .lock()
+                .unwrap()
                 .insert(meta.block_id.0.clone(), (shard.data, meta.clone()));
             Ok(Response::new(PutBlockResponse {}))
         }
@@ -355,27 +427,42 @@ pub mod mem_store {
             let id = req.into_inner().block_id;
             let map = self.blocks.lock().unwrap();
             let (data, meta) = map.get(&id).ok_or_else(|| Status::not_found(id.clone()))?;
-            let shard = ProtoShard { index: u32::from(meta.shard_index), data: data.clone() };
-            Ok(Response::new(GetBlockResponse { shard: Some(shard), meta: Some((*meta).clone().into()) }))
+            let shard = ProtoShard {
+                index: u32::from(meta.shard_index),
+                data: data.clone(),
+            };
+            Ok(Response::new(GetBlockResponse {
+                shard: Some(shard),
+                meta: Some((*meta).clone().into()),
+            }))
         }
 
         async fn delete_block(
             &self,
             req: Request<DeleteBlockRequest>,
         ) -> std::result::Result<Response<DeleteBlockResponse>, Status> {
-            self.blocks.lock().unwrap().remove(&req.into_inner().block_id);
+            self.blocks
+                .lock()
+                .unwrap()
+                .remove(&req.into_inner().block_id);
             Ok(Response::new(DeleteBlockResponse {}))
         }
 
-        async fn list_blocks(&self, _: Request<ListBlocksRequest>)
-            -> std::result::Result<Response<ListBlocksResponse>, Status> {
+        async fn list_blocks(
+            &self,
+            _: Request<ListBlocksRequest>,
+        ) -> std::result::Result<Response<ListBlocksResponse>, Status> {
             let ids = self.blocks.lock().unwrap().keys().cloned().collect();
             Ok(Response::new(ListBlocksResponse { block_ids: ids }))
         }
 
-        async fn block_count(&self, _: Request<BlockCountRequest>)
-            -> std::result::Result<Response<BlockCountResponse>, Status> {
-            Ok(Response::new(BlockCountResponse { count: self.blocks.lock().unwrap().len() as u64 }))
+        async fn block_count(
+            &self,
+            _: Request<BlockCountRequest>,
+        ) -> std::result::Result<Response<BlockCountResponse>, Status> {
+            Ok(Response::new(BlockCountResponse {
+                count: self.blocks.lock().unwrap().len() as u64,
+            }))
         }
 
         async fn stat_block(
@@ -385,27 +472,45 @@ pub mod mem_store {
             let id = req.into_inner().block_id;
             let map = self.blocks.lock().unwrap();
             let (_, meta) = map.get(&id).ok_or_else(|| Status::not_found(id.clone()))?;
-            Ok(Response::new(StatBlockResponse { meta: Some((*meta).clone().into()) }))
+            Ok(Response::new(StatBlockResponse {
+                meta: Some((*meta).clone().into()),
+            }))
         }
 
-        async fn join(&self, _: Request<JoinRequest>)
-            -> std::result::Result<Response<JoinResponse>, Status> {
-            Ok(Response::new(JoinResponse { ring: Some(Ring { node_ids: vec![], version: 1 }) }))
+        async fn join(
+            &self,
+            _: Request<JoinRequest>,
+        ) -> std::result::Result<Response<JoinResponse>, Status> {
+            Ok(Response::new(JoinResponse {
+                ring: Some(Ring {
+                    node_ids: vec![],
+                    version: 1,
+                }),
+            }))
         }
 
-        async fn gossip(&self, _: Request<GossipRequest>)
-            -> std::result::Result<Response<GossipResponse>, Status> {
+        async fn gossip(
+            &self,
+            _: Request<GossipRequest>,
+        ) -> std::result::Result<Response<GossipResponse>, Status> {
             Ok(Response::new(GossipResponse {}))
         }
 
-        async fn ping(&self, _: Request<PingRequest>)
-            -> std::result::Result<Response<PongResponse>, Status> {
+        async fn ping(
+            &self,
+            _: Request<PingRequest>,
+        ) -> std::result::Result<Response<PongResponse>, Status> {
             Ok(Response::new(PongResponse {}))
         }
 
-        async fn health_check(&self, _: Request<HealthCheckRequest>)
-            -> std::result::Result<Response<HealthCheckResponse>, Status> {
-            Ok(Response::new(HealthCheckResponse { block_count: 0, disk_used: vec![] }))
+        async fn health_check(
+            &self,
+            _: Request<HealthCheckRequest>,
+        ) -> std::result::Result<Response<HealthCheckResponse>, Status> {
+            Ok(Response::new(HealthCheckResponse {
+                block_count: 0,
+                disk_used: vec![],
+            }))
         }
     }
 }

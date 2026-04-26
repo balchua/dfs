@@ -156,9 +156,8 @@ fn make_padded(data: &[u8], shard_len: usize, k: usize) -> Vec<u8> {
     padded
 }
 
-/// Estimate the original length by removing trailing zeros.
-///lexiconFor empty data orencoding that happens to end with zeros, the
-/// caller must store the original length externally (e.g. in object metadata).
+/// Estimate the original data length from padded shards by removing
+/// trailing zero bytes.
 fn effective_len(data: &[u8]) -> usize {
     if data.is_empty() {
         return 0;
@@ -166,6 +165,62 @@ fn effective_len(data: &[u8]) -> usize {
     data.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1)
 }
 
+/// Stripe configuration for streaming large payloads.
+///
+/// A stripe is one EC block: `stripe_size` bytes are split into `k` data
+/// shards (each `stripe_size / k` bytes), then `m` parity shards are
+/// computed. A large file is processed one stripe at a time to keep
+/// per-shard sizes under gRPC message limits.
+#[derive(Debug, Clone, Copy)]
+pub struct StripeConfig {
+    /// Desired stripe payload — total bytes per encode call.
+    /// Must be evenly divisible by `k`.
+    pub stripe_size: usize,
+}
+
+impl StripeConfig {
+    /// Pick a stripe size such that each shard fits within `max_shard_bytes`.
+    pub fn for_shard_limit(max_shard_bytes: usize, k: u8) -> Self {
+        let stripe_size = max_shard_bytes * (k as usize);
+        Self { stripe_size }
+    }
+}
+
+/// Encode `data` in stripes, returning one [`Stripe`] per stripe.
+///
+/// Each stripe contains `k + m` shards; the first `k` are data shards,
+/// the last `m` are parity. The final stripe may be shorter (zero-padded
+/// to `stripe_size`).
+pub fn encode_striped(data: &[u8], config: &ErasureConfig, stripe: &StripeConfig) -> Vec<Vec<Shard>> {
+    let mut stripes = Vec::new();
+    for chunk in data.chunks(stripe.stripe_size) {
+        let shards = encode(chunk, config)
+            .expect("encode_striped: stripe encoding failed (config must be valid)");
+        stripes.push(shards);
+    }
+    stripes
+}
+
+/// Decode a list of stripes back into the original data.
+///
+/// `stripes` is a list where each entry is `Vec<Option<Shard>>` for that stripe.
+/// Missing shards in a stripe must be `None`.
+pub fn decode_striped(
+    stripes: Vec<Vec<Option<Shard>>>,
+    config: &ErasureConfig,
+    original_len: usize,
+) -> Result<Vec<u8>> {
+    let mut result = Vec::with_capacity(original_len);
+    for stripe_shards in stripes {
+        let decoded = decode(stripe_shards, config)?;
+        result.extend_from_slice(&decoded);
+    }
+    result.truncate(original_len);
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -292,6 +347,34 @@ mod tests {
             .map(|s| Some(s.clone()))
             .collect();
         let decoded = decode(subset, &cfg).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn encode_striped_roundtrip() {
+        let cfg = ErasureConfig { k: 3, m: 2 };
+        let stripe = StripeConfig::for_shard_limit(128, 3);
+        let data = b"this is a test payload for striped encoding!".to_vec();
+        let stripes = encode_striped(&data, &cfg, &stripe);
+        let reconstructed: Vec<Vec<Option<Shard>>> = stripes
+            .iter()
+            .map(|ss| ss.iter().map(|s| Some(s.clone())).collect())
+            .collect();
+        let decoded = decode_striped(reconstructed, &cfg, data.len()).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn encode_striped_large_payload() {
+        let cfg = ErasureConfig { k: 3, m: 2 };
+        let stripe = StripeConfig::for_shard_limit(512, 3); // 512 bytes per stripe
+        let data: Vec<u8> = (0u8..=127).cycle().take(100_000).collect();
+        let stripes = encode_striped(&data, &cfg, &stripe);
+        let reconstructed: Vec<Vec<Option<Shard>>> = stripes
+            .iter()
+            .map(|ss| ss.iter().map(|s| Some(s.clone())).collect())
+            .collect();
+        let decoded = decode_striped(reconstructed, &cfg, data.len()).unwrap();
         assert_eq!(decoded, data);
     }
 }

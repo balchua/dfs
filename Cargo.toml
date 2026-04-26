@@ -14,7 +14,7 @@ reed-solomon-erasure = "6"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 thiserror = "2"
 async-trait = "0.1"
 tracing = "0.1"
